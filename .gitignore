@@ -20,3 +20,7 @@ keystore.properties
 # OS
 .DS_Store
 Thumbs.db
+
+# Tools for Autodarts — fetched and built by tools/tfa-build.mjs, never committed
+third_party/
+app/src/main/assets/tfa/

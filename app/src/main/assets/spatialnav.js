@@ -7,9 +7,9 @@
   window.__adnav = true;
 
   // ---------- highlight style: shiny white glow ----------
-  var style = document.createElement('style');
-  style.id = '__adnav_style';
-  style.textContent =
+  // Styles do not cross shadow boundaries, so this text gets stamped into every
+  // shadow root we walk into as well — see ensureStyle().
+  var STYLE_TEXT =
     '@keyframes __adnav_pulse {' +
     '  0%   { box-shadow: 0 0 10px 3px rgba(255,255,255,0.55), 0 0 0 2px rgba(255,255,255,0.9); }' +
     '  50%  { box-shadow: 0 0 18px 6px rgba(255,255,255,0.75), 0 0 0 2px rgba(255,255,255,1); }' +
@@ -23,7 +23,21 @@
     '  position: relative;' +
     '  z-index: 2147483646;' +
     '}';
-  (document.head || document.documentElement).appendChild(style);
+
+  /** Inject the highlight CSS into a document or shadow root, once each. */
+  function ensureStyle(root) {
+    if (!root || root.__adnav_styled) return;
+    root.__adnav_styled = true;
+    var style = document.createElement('style');
+    style.id = '__adnav_style';
+    style.textContent = STYLE_TEXT;
+    var host = (root === document)
+      ? (document.head || document.documentElement)
+      : root;
+    host.appendChild(style);
+  }
+
+  ensureStyle(document);
 
   var current = null;
 
@@ -46,17 +60,53 @@
     return true;
   }
 
-  function candidates() {
-    var all = document.querySelectorAll(SELECTOR);
-    var out = [];
+  /** True if the element only wraps another candidate (avoid double hits). */
+  function wrapsCandidate(el) {
+    if (el.querySelector && el.querySelector(SELECTOR)) return true;
+    // A shadow host's own light DOM is often empty while the real controls sit
+    // inside its shadow root — those are the ones we want, not the host.
+    if (el.shadowRoot && el.shadowRoot.querySelector(SELECTOR)) return true;
+    return false;
+  }
+
+  /**
+   * Collect focusable elements from a root, descending into every open shadow
+   * root on the way down.
+   *
+   * This is what makes the "Tools for Autodarts" settings panel reachable at
+   * all: it mounts via createShadowRootUi() under <autodarts-tools-wxt>, and a
+   * plain document.querySelectorAll() sees nothing inside it. Without this the
+   * one screen you most want the remote for would be completely dead.
+   */
+  function collectDeep(root, out) {
+    var all = root.querySelectorAll('*');
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
+      if (el.shadowRoot) {
+        ensureStyle(el.shadowRoot);
+        observe(el.shadowRoot);
+        collectDeep(el.shadowRoot, out);
+      }
       if (el === current) continue;
-      // skip elements that merely wrap another candidate (avoid double hits)
-      if (el.querySelector && el.querySelector(SELECTOR)) continue;
+      if (!el.matches || !el.matches(SELECTOR)) continue;
+      if (wrapsCandidate(el)) continue;
       if (isVisible(el)) out.push(el);
     }
+  }
+
+  function candidates() {
+    var out = [];
+    collectDeep(document, out);
     return out;
+  }
+
+  /** The innermost active element, following shadow roots down. */
+  function deepActiveElement() {
+    var el = document.activeElement;
+    while (el && el.shadowRoot && el.shadowRoot.activeElement) {
+      el = el.shadowRoot.activeElement;
+    }
+    return el;
   }
 
   function rect(el) { return el.getBoundingClientRect(); }
@@ -192,7 +242,7 @@
 
   window.addEventListener('keydown', function (ev) {
     var dir = KEYMAP[ev.key];
-    var active = document.activeElement;
+    var active = deepActiveElement();
 
     // While typing in a text field: left/right move the caret,
     // up/down leave the field and resume navigation.
@@ -221,11 +271,20 @@
   }, true); // capture phase: run before the app's own key handlers
 
   // SPA route changes / dialogs: if the highlighted element disappears,
-  // pick a fresh one so the highlight never gets "lost".
+  // pick a fresh one so the highlight never gets "lost". Shadow roots get the
+  // same treatment as they are discovered, so panels that re-render internally
+  // (the settings UI switching tabs) don't strand the highlight either.
   var mo = new MutationObserver(function () {
     if (current && !isVisible(current)) setCurrent(pickInitial());
   });
-  mo.observe(document.documentElement, { childList: true, subtree: true });
+
+  function observe(root) {
+    if (!mo || !root || root.__adnav_observed) return;
+    root.__adnav_observed = true;
+    mo.observe(root, { childList: true, subtree: true });
+  }
+
+  observe(document.documentElement);
 
   // initial highlight once the page settles
   setTimeout(function () { if (!current) setCurrent(pickInitial()); }, 800);
