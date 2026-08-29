@@ -30,6 +30,16 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
+      # NOTE: "Tools for Autodarts" is deliberately NOT built here, so released
+      # APKs ship without it. Upstream's licensing is contradictory (LICENSE and
+      # README say CC BY-NC 4.0, package.json says MIT) — see the "Tools for
+      # Autodarts" section of README.md. Do not enable this without clearing
+      # redistribution with creazy231 first.
+      #
+      # - uses: actions/setup-node@v4
+      #   with: { node-version: "20" }
+      # - run: corepack enable && node tools/tfa-build.mjs
+
       - name: Decode keystore
         run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/release.keystore"
 
