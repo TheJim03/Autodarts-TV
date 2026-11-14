@@ -500,6 +500,68 @@
   };
 
   // =========================================================================
+  // history: keep the extension's own route away from the site's router
+  // =========================================================================
+  // The settings overlay opens with history.pushState(null, "", "/tools") and
+  // relies on the site NOT noticing: /tools is not a route the site has, the
+  // overlay just needs the URL to say so. In a browser that holds, because a
+  // content script lives in an isolated world and calls the pristine
+  // pushState, not the copy the site's router has wrapped to hear about
+  // navigations. Here there is one world. The call lands in the router's
+  // wrapper, the router looks up /tools, and the user gets the site's 404 page
+  // instead of the settings (seen on a SHIELD, not reproducible on a snapshot).
+  //
+  // So calls for the extension's routes go to the native method, and everything
+  // else goes wherever the site pointed pushState. Installed as an accessor on
+  // the history object so it holds whether the router wraps before or after us.
+  var EXTENSION_ROUTES = /^\/tools(\/|$|\?|#)/;
+
+  function isExtensionRoute(url) {
+    if (url == null) return false;
+    try { return EXTENSION_ROUTES.test(new URL(String(url), location.href).pathname); }
+    catch (e) { return false; }
+  }
+
+  function guardHistory(name) {
+    try {
+      var native = History.prototype[name];
+      var own = Object.getOwnPropertyDescriptor(history, name);
+      var sitePatched = own && typeof own.value === 'function' ? own.value : null;
+      // The site's wrapper calls "the original" it captured — which is this
+      // function. That inner call must reach the native method, or the two
+      // would hand the call back and forth forever.
+      var inSite = false;
+      var wrapper = function (state, title, url) {
+        if (name === 'pushState' && isExtensionRoute(url) && isExtensionRoute(location.href)) {
+          // Already there (the drawer entry chosen while the overlay is open,
+          // or the extension reopening it after a reload): do not stack a
+          // second /tools entry. Going BACK onto one fires popstate, which the
+          // router does hear — and answers with its 404 page.
+          return History.prototype.replaceState.apply(history, arguments);
+        }
+        if (inSite || !sitePatched || isExtensionRoute(url)) return native.apply(history, arguments);
+        inSite = true;
+        try { return sitePatched.apply(history, arguments); }
+        finally { inSite = false; }
+      };
+      Object.defineProperty(history, name, {
+        configurable: true,
+        enumerable: true,
+        get: function () { return wrapper; },
+        // The router "replaces" pushState by assignment; keep what it assigns
+        // as the destination for ordinary navigations. It captured our wrapper
+        // as the original, so the chain still ends at the native method.
+        set: function (fn) { if (typeof fn === 'function' && fn !== wrapper) sitePatched = fn; }
+      });
+    } catch (e) {
+      log('could not guard history.' + name, e);
+    }
+  }
+
+  guardHistory('pushState');
+  guardHistory('replaceState');
+
+  // =========================================================================
   // Assemble the namespace
   // =========================================================================
 

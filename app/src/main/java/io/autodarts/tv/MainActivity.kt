@@ -38,6 +38,8 @@ class MainActivity : Activity() {
 
         private const val TAG = "AutodartsTV"
 
+        private const val VIEWPORT_SCRIPT = "tv-viewport.js"
+
         /**
          * INJECTION ORDER — do not reshuffle.
          *
@@ -159,12 +161,16 @@ class MainActivity : Activity() {
             override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
                 bridge.setCurrentUrl(url)
+                // First, and on every host: the layout width has to be settled
+                // before the page measures anything. See tv-viewport.js.
+                inject(view, VIEWPORT_SCRIPT)
                 if (!isTfaHost(url)) return
                 DOCUMENT_START_SCRIPTS.forEach { inject(view, it) }
             }
 
             override fun onPageFinished(view: WebView, url: String) {
                 bridge.setCurrentUrl(url)
+                inject(view, VIEWPORT_SCRIPT)   // guarded; covers a lost race
                 if (isTfaHost(url)) {
                     // Safety net: if onPageStarted lost the race with the document
                     // swap, the guarded re-injection below still gets the shim in.

@@ -21,6 +21,7 @@ Autodarts runs great on a Raspberry Pi at the board, and the web app is the natu
 - **Smart directional search** — pressing *up* really goes up: same-column/row elements are preferred, with a 45° cone as fallback
 - **Auto-scroll** — if there's nothing further in the pressed direction, the page scrolls and the search continues, so the very top and bottom of long pages stay reachable (works with virtualized lists too)
 - **Cursor fallback** — press MENU to toggle a free-moving virtual mouse cursor for anything the focus navigation can't reach
+- **TV-sized layout** — the page is laid out 1280 px wide instead of the 960 px a 1080p TV reports, so the site shows its desktop layout rather than a phone layout blown up 2×
 - **Fullscreen, landscape, no browser chrome**
 
 ## Controls
@@ -74,6 +75,7 @@ You'll land on the Autodarts welcome screen; choose *Anmelden / Sign in* and log
 - **Start URL**: `START_URL` in [`MainActivity.kt`](app/src/main/java/io/autodarts/tv/MainActivity.kt) — point it directly at your board or match view, e.g. `https://play.autodarts.com/boards/<board-id>/follow`
 - **Highlight style**: the `#__adnav_ring` rule in [`spatialnav.js`](app/src/main/assets/spatialnav.js)
 - **Clickable element detection**: the `STRONG` / `HEURISTIC` lists in `spatialnav.js`, in case some element isn't picked up
+- **Layout width**: `LAYOUT_WIDTH` in [`tv-viewport.js`](app/src/main/assets/tv-viewport.js) — smaller means bigger UI
 - **Cursor speed** (fallback mode): constants in [`CursorLayout.kt`](app/src/main/java/io/autodarts/tv/CursorLayout.kt)
 
 Quick iteration tip: paste the contents of `spatialnav.js` into the DevTools console on play.autodarts.com in a desktop browser — the arrow keys behave exactly like the D-pad on the TV, no rebuild needed. For changes to the navigation itself there is a regression page: serve the repository root (`python -m http.server`) and open `tools/navtest.html`.
@@ -168,6 +170,17 @@ These had to be bridged:
   `getURL()` is redirected to an empty `__noop.js`, otherwise `window.WebSocket`
   would get patched twice. `quiet-own-darts.js` (3.x) is injected on demand and
   guards itself, so it simply loads through the asset loader.
+
+### One JS world, and the router that listens in it
+
+The settings overlay opens with `history.pushState(null, "", "/tools")` and counts
+on the site not noticing — true in a browser, where a content script calls the
+pristine `pushState`, not the copy the site's router has wrapped. In a WebView
+there is one world: the router heard the call, looked up `/tools`, and showed
+its 404 page. `tfa-shim.js` therefore routes pushes to the extension's own
+paths straight to the native method (and never stacks two of them, since going
+BACK onto one is a `popstate` the router does hear). This only showed up on a
+real TV; no snapshot test could have caught it.
 
 ### Plain http, for WLED only
 

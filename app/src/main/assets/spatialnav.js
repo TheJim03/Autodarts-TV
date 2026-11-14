@@ -70,14 +70,22 @@
     '[data-slot="drawer-content"]', '[data-slot="sheet-content"]',
     '[data-slot="popover-content"]', '[data-slot="dropdown-menu-content"]',
     '[data-slot="context-menu-content"]', '[data-slot="select-content"]',
-    '[data-slot="combobox-content"]'
+    '[data-slot="combobox-content"]',
+    // The live site (Base UI) names the same parts "-popup": its user drawer
+    // is <div role="dialog" data-slot="drawer-popup">, with no aria-modal.
+    '[data-slot="dialog-popup"]', '[data-slot="alert-dialog-popup"]',
+    '[data-slot="drawer-popup"]', '[data-slot="sheet-popup"]',
+    '[data-slot="popover-popup"]', '[data-slot="menu-popup"]',
+    '[data-slot="select-popup"]', '[data-slot="combobox-popup"]'
   ].join(',');
 
   // The subset that must not be left with the D-pad: BACK closes them.
   var STRICT_POPUP_SELECTOR = [
     'dialog[open]', '[aria-modal="true"]', '[role="alertdialog"]',
     '[data-slot="dialog-content"]', '[data-slot="alert-dialog-content"]',
-    '[data-slot="drawer-content"]', '[data-slot="sheet-content"]'
+    '[data-slot="drawer-content"]', '[data-slot="sheet-content"]',
+    '[data-slot="dialog-popup"]', '[data-slot="alert-dialog-popup"]',
+    '[data-slot="drawer-popup"]', '[data-slot="sheet-popup"]'
   ].join(',');
 
   // ---------- shadow-DOM-aware helpers ----------
@@ -436,22 +444,26 @@
    * jumped there and could never get back down. Starting from the edge it left
    * through keeps "down" meaning down.
    */
-  function originRect() {
+  function originRect(dir) {
     var r = rect(current);
     var c = clipRect(current);
-    var o = {
-      left: Math.min(Math.max(r.left, c.left), c.right),
-      right: Math.max(Math.min(r.right, c.right), c.left),
-      top: Math.min(Math.max(r.top, c.top), c.bottom),
-      bottom: Math.max(Math.min(r.bottom, c.bottom), c.top)
-    };
+    var o = { left: r.left, right: r.right, top: r.top, bottom: r.bottom };
+    // Only ever pull the origin FORWARD, to the edge it was left behind at.
+    // Pulling back an element that lies ahead of the screen (a drawer taller
+    // than the TV: its last entries sit below the bottom edge and nothing
+    // scrolls) would put it behind things it is actually past, and "down"
+    // would bounce back up.
+    if (dir === 'down' && r.bottom <= c.top) { o.top = o.bottom = c.top; }
+    if (dir === 'up' && r.top >= c.bottom) { o.top = o.bottom = c.bottom; }
+    if (dir === 'right' && r.right <= c.left) { o.left = o.right = c.left; }
+    if (dir === 'left' && r.left >= c.right) { o.left = o.right = c.right; }
     o.width = o.right - o.left;
     o.height = o.bottom - o.top;
     return o;
   }
 
   function searchOnce(dir, cands) {
-    var c = originRect();
+    var c = originRect(dir);
     var cx = c.left + c.width / 2, cy = c.top + c.height / 2;
     var vertical = (dir === 'up' || dir === 'down');
 
@@ -833,8 +845,37 @@
     selfFocus = false;
   }
 
+  // When a choice made inside a popup leads to a new screen. The popup closes
+  // and the page hands focus back to its trigger up in the header — but the
+  // user picked a destination (Settings, Devices, Tools for Autodarts), so the
+  // highlight belongs on that screen, not back on the avatar.
+  // Watched for directly rather than in the mutation handler: the URL changes
+  // while the popup is still animating shut, several re-renders before the
+  // new screen has anything to highlight.
+  var screenWatch = null;
+  // The closing popup hands focus back to its trigger a moment AFTER the new
+  // screen has been picked; until this time, that hand-back is not followed.
+  var ignoreFocusReturnUntil = 0;
+
+  function followToNewScreen() {
+    var from = location.href;
+    var tries = 0;
+    if (screenWatch) clearInterval(screenWatch);
+    screenWatch = setInterval(function () {
+      var done = ++tries > 30;                       // ~4.5s, then give up
+      if (!done && location.href !== from && !popupOf(current) && api.overlays() === 0) {
+        ignoreFocusReturnUntil = Date.now() + 2000;
+        setCurrent(null);
+        pickFirstSoon();
+        done = true;
+      }
+      if (done) { clearInterval(screenWatch); screenWatch = null; }
+    }, 150);
+  }
+
   function activate(el) {
     if (!el) return;
+    if (popupOf(el)) followToNewScreen();
     if (isTextInput(el)) { focusQuietly(el); return; } // focus -> on-screen keyboard
     focusQuietly(el);
     if (el.tagName === 'SELECT' && typeof el.showPicker === 'function') {
@@ -902,6 +943,7 @@
   function adoptFocus(target, attempt) {
     if (!target || !target.isConnected) return;
     var popup = popupOf(target);
+    if (!popup && Date.now() < ignoreFocusReturnUntil) return;
     var pick = null;
     if (target.matches && target.matches(SELECTOR) && isVisible(target)) {
       pick = target;
@@ -976,7 +1018,8 @@
       // The highlight was inside a popup that has just closed. The page puts
       // focus back on whatever opened it, which is exactly where the highlight
       // belongs — better than the nearest thing to where the popup used to be.
-      if (wasInPopup && active && active.matches && active.matches(SELECTOR) && isVisible(active)) {
+      if (wasInPopup && Date.now() >= ignoreFocusReturnUntil &&
+          active && active.matches && active.matches(SELECTOR) && isVisible(active)) {
         setCurrent(active);
         return;
       }
