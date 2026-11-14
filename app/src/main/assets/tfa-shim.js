@@ -66,6 +66,10 @@
    * Failure here is harmless by design: content.js only uses onload to call
    * script.remove(), and websocket-monitor.js catches and logs onerror.
    */
+  // NOT in this list: /quiet-own-darts.js (3.x). The match script injects it on
+  // demand, it guards itself against a second run, and nothing here runs it
+  // inline — so its <script src> has to load for real, which it does: the
+  // asset loader serves it and the page has no CSP to object.
   var NOOP_SCRIPTS = ['/auth-cookie.js', '/websocket-capture.js'];
   var NOOP_TARGET = '__noop.js';
 
@@ -207,10 +211,16 @@
   // =========================================================================
   // runtime.sendMessage
   // =========================================================================
-  // Every one of the 8 upstream call sites sends { type: "fetch", url, options }.
-  // The MV3 service worker existed only to dodge CORS; OkHttp has no CORS.
+  // The MV3 service worker is gone; everything it answered is answered here.
+  // Upstream's entrypoints/background.ts handles exactly these message types,
+  // and tools/tfa-build.mjs fails the build if a release adds another:
   //
-  // Response contract, verbatim from upstream entrypoints/background.ts:
+  //   fetch                 CORS-free HTTP        -> TfaBridge.fetchProxy
+  //   teams:reorder-lease   one tab per lobby     -> trivially granted, below
+  //   teams:undo-visit      undo a visit, once    -> ported below, over fetch
+  //   wled:upload           file onto a WLED      -> TfaBridge.wledUpload
+  //
+  // fetch response contract, verbatim from upstream:
   //   { ok, status?, statusText?, data?, error? }
   // where `data` is a data: URL (data:<mime>;base64,...) exactly as
   // FileReader.readAsDataURL produces — NOT bare base64.
@@ -219,13 +229,148 @@
   // deliberately not implemented: it only engages when the response itself
   // sets tooLarge:true. We never do, so the simple path always runs.
 
+  function bridgeFetch(url, options, timeoutMs) {
+    var opts = {};
+    for (var k in (options || {})) opts[k] = options[k];
+    // Rides along inside the options JSON; TfaBridge strips it back out.
+    if (typeof timeoutMs === 'number' && timeoutMs > 0) opts.__timeoutMs = timeoutMs;
+    return callBridge('fetchProxy', [String(url || ''), JSON.stringify(opts)]);
+  }
+
+  // ---- teams:reorder-lease (upstream utils/teams-lease.ts) ----
+  // Upstream hands a lobby's seat reorder to one tab at a time, because the
+  // same lobby open in two tabs would send every move twice. A WebView is one
+  // tab, so the claim is always granted; the bookkeeping is kept only so a
+  // release still reads as the mirror image of a claim.
+  var leases = Object.create(null);
+
+  function reorderLease(msg) {
+    var lobby = String(msg.lobbyId == null ? '' : msg.lobbyId);
+    if (msg.release) delete leases[lobby];
+    else leases[lobby] = Date.now() + 30000;
+    return true;
+  }
+
+  // ---- teams:undo-visit (upstream utils/teams-undo.ts) ----
+  // Takes back every dart of a visit with the site's own undo, then passes the
+  // turn. Remembered per match+darts so a frame the site sends twice undoes
+  // the visit once — the reason upstream keeps this out of the content script.
+  var undone = Object.create(null);
+  var NEXT_RETRY_MS = [400, 1200];
+
+  function pause(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); }
+
+  function apiPost(path) {
+    return storageLocal.get('globalstatus').then(function (stored) {
+      var status = stored && stored.globalstatus;
+      var token = (status && status.auth && status.auth.token) || '';
+      return bridgeFetch('https://api.autodarts.com' + path, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + token }
+      });
+    }).then(function (response) {
+      return !!(response && response.ok);
+    }, function () {
+      return false;   // a request that can't be made is refused as much as a 403 is
+    });
+  }
+
+  function takeBack(matchId, darts) {
+    var undo = '/gs/v0/matches/' + matchId + '/undo';
+    var next = '/gs/v0/matches/' + matchId + '/players/next';
+    var chain = Promise.resolve(true);
+    for (var i = 0; i < darts; i++) {
+      chain = chain.then(function (ok) { return ok ? apiPost(undo) : false; });
+    }
+    return chain.then(function (ok) {
+      if (!ok) return { ok: false, stage: 'undo' };
+      // The darts are gone now; only the turn is left to pass. Upstream saw it
+      // fail straight after the undos and work a moment later, hence retries.
+      var attempt = function (index) {
+        return apiPost(next).then(function (passed) {
+          if (passed) return { ok: true };
+          if (index >= NEXT_RETRY_MS.length) return { ok: false, stage: 'next' };
+          return pause(NEXT_RETRY_MS[index]).then(function () { return attempt(index + 1); });
+        });
+      };
+      return attempt(0);
+    });
+  }
+
+  function undoVisit(msg) {
+    var matchId = String(msg.matchId == null ? '' : msg.matchId);
+    var dartIds = Array.isArray(msg.dartIds) ? msg.dartIds : [];
+    if (!matchId || !dartIds.length) return Promise.resolve({ ok: true, skipped: true });
+    var key = matchId + '|' + dartIds.join(',');
+    if (undone[key]) {
+      return undone[key].then(function (r) {
+        var copy = {};
+        for (var k in r) copy[k] = r[k];
+        copy.skipped = true;
+        return copy;
+      });
+    }
+    undone[key] = takeBack(matchId, dartIds.length);
+    return undone[key];
+  }
+
+  // ---- wled:upload (upstream utils/wled-upload.ts) ----
+  // One file POSTed to a WLED's /upload as multipart. The checks are upstream's
+  // own, repeated here on purpose: they are what stops this from writing a
+  // cfg.json, which WLED would apply and reboot with. The upload itself needs
+  // a real HTTP client (multipart body, a device on the LAN), so it is Kotlin.
+  var WLED_NAME = /^\/[\w.-]{1,30}$/;
+  var WLED_GIF = /^[\w.-]+\.gif$/i;
+
+  function isJsonObject(text) {
+    if (typeof text !== 'string') return false;
+    try {
+      var value = JSON.parse(text);
+      return !!value && typeof value === 'object' && !Array.isArray(value);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function wledUpload(msg) {
+    var origin;
+    try {
+      var url = new URL(msg.url);
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+        return Promise.resolve({ ok: false, error: 'not a web address' });
+      }
+      origin = url.origin;
+    } catch (e) {
+      return Promise.resolve({ ok: false, error: 'not an address' });
+    }
+    if (typeof msg.name !== 'string' || !WLED_NAME.test(msg.name) || msg.name.indexOf('..') >= 0) {
+      return Promise.resolve({ ok: false, error: 'not a file name WLED keeps' });
+    }
+    if (msg.gif !== undefined) {
+      if (typeof msg.gif !== 'string' || !WLED_GIF.test(msg.gif) || msg.name !== '/' + msg.gif) {
+        return Promise.resolve({ ok: false, error: 'not a GIF of the catalog' });
+      }
+    } else if (msg.name !== '/presets.json' || !isJsonObject(msg.text)) {
+      return Promise.resolve({ ok: false, error: 'not a presets.json' });
+    }
+    return callBridge('wledUpload', [
+      origin,
+      msg.name,
+      msg.gif !== undefined ? msg.gif : '',
+      msg.gif !== undefined ? '' : msg.text,
+      typeof msg.timeoutMs === 'number' ? msg.timeoutMs : 20000
+    ]).catch(function (e) {
+      return { ok: false, error: e && e.message ? e.message : String(e) };
+    });
+  }
+
   function sendMessage(message) {
     var msg = message || {};
-    if (msg.type === 'fetch') {
-      return callBridge('fetchProxy', [
-        String(msg.url || ''),
-        JSON.stringify(msg.options || {})
-      ]);
+    switch (msg.type) {
+      case 'fetch': return bridgeFetch(msg.url, msg.options, msg.timeoutMs);
+      case 'teams:reorder-lease': return Promise.resolve(reorderLease(msg));
+      case 'teams:undo-visit': return undoVisit(msg);
+      case 'wled:upload': return wledUpload(msg);
     }
     log('unhandled sendMessage type:', msg.type, msg);
     return Promise.resolve(undefined);
