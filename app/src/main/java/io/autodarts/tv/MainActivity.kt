@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.KeyEvent
 import android.view.View
@@ -76,6 +78,8 @@ class MainActivity : Activity() {
     private lateinit var assetLoader: WebViewAssetLoader
     private lateinit var bridge: TfaBridge
 
+    private val backHandler = Handler(Looper.getMainLooper())
+
     /** Cache: asset path -> file contents. Avoids re-reading on every navigation. */
     private val scriptCache = HashMap<String, String>()
 
@@ -138,6 +142,18 @@ class MainActivity : Activity() {
                 headers["Access-Control-Allow-Origin"] = "*"
                 response.responseHeaders = headers
                 return response
+            }
+
+            // usesCleartextTraffic is on so that TfaBridge can reach WLED
+            // controllers on the LAN, and that switch is app-wide. The WebView
+            // itself has no business on plain http, so keep it off: anything
+            // that is not https stays unloaded. (Subresources are covered by the
+            // default mixed-content mode, which blocks them on an https page.)
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                val scheme = request.url.scheme?.lowercase()
+                if (scheme == "https" || scheme == "about" || scheme == "blob" || scheme == "data") return false
+                Log.w(TAG, "blocked non-https navigation: ${request.url}")
+                return true
             }
 
             override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
@@ -223,9 +239,10 @@ class MainActivity : Activity() {
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         when (keyCode) {
-            // BACK navigates the WebView history instead of closing the app
-            KeyEvent.KEYCODE_BACK -> if (webView.canGoBack()) {
-                webView.goBack()
+            // BACK closes whatever is open on the page first — drawer, dialog,
+            // menu — and only then navigates the WebView history.
+            KeyEvent.KEYCODE_BACK -> {
+                handleBack()
                 return true
             }
             // MENU (or the "settings"/hamburger button on many remotes) toggles
@@ -242,6 +259,45 @@ class MainActivity : Activity() {
             }
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    /**
+     * v2 puts settings, devices and the Tools for Autodarts entry in a drawer,
+     * and most choices in dialogs and menus. With BACK wired straight to
+     * history, the only way out of any of them was to leave the page they were
+     * opened on. So: ask spatialnav.js how many overlays are open; if any, send
+     * the page a real Escape (a trusted key event — one synthesized in JS has
+     * isTrusted=false, which component libraries are free to ignore), and
+     * check afterwards that one actually closed. If nothing did, fall back to
+     * history so BACK can never become a dead key.
+     */
+    private fun handleBack() {
+        countOverlays { open ->
+            if (open <= 0) {
+                goBackOrExit()
+                return@countOverlays
+            }
+            sendEscape()
+            backHandler.postDelayed({
+                countOverlays { stillOpen -> if (stillOpen >= open) goBackOrExit() }
+            }, 350)
+        }
+    }
+
+    private fun countOverlays(then: (Int) -> Unit) {
+        webView.evaluateJavascript(
+            "(window.__adnav && window.__adnav.overlays) ? window.__adnav.overlays() : 0"
+        ) { result -> then(result?.trim()?.toIntOrNull() ?: 0) }
+    }
+
+    private fun sendEscape() {
+        webView.requestFocus()
+        webView.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ESCAPE))
+        webView.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ESCAPE))
+    }
+
+    private fun goBackOrExit() {
+        if (webView.canGoBack()) webView.goBack() else finish()
     }
 
     override fun onPause() {

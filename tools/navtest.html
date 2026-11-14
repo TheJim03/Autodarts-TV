@@ -1,0 +1,240 @@
+<!doctype html>
+<!--
+  Regression page for app/src/main/assets/spatialnav.js.
+
+  Serve the repository root and open this file, e.g.
+
+      python -m http.server 8000
+      http://localhost:8000/tools/navtest.html
+
+  It rebuilds, in miniature, the structures of Autodarts Play v2 (shadcn/ui on
+  Base UI) that the navigation has to cope with, drives them through
+  window.__adnav, and prints PASS/FAIL per case. Arrow keys work on the page
+  too, so it doubles as a playground: they behave exactly like the D-pad.
+-->
+<meta charset="utf-8">
+<title>spatialnav regression</title>
+<style>
+  html, body { margin: 0; height: 100%; font: 14px system-ui, sans-serif; background: #10131a; color: #eee; }
+  body { overflow: hidden; }
+  button, a { font: inherit; color: inherit; }
+  .shell { height: 100vh; display: flex; flex-direction: column; }
+  header { flex: none; height: 56px; display: flex; gap: 12px; align-items: center; padding: 0 16px; background: #1b1f29; }
+  header a, header button { padding: 8px 12px; background: none; border: 0; text-decoration: none; }
+  main { flex: 1; min-height: 0; overflow: hidden; }
+  #scroller { height: 100%; overflow-y: auto; padding: 16px; box-sizing: border-box; }
+  .row { display: flex; gap: 12px; margin-bottom: 16px; align-items: flex-start; }
+  .card { position: relative; width: 200px; height: 90px; background: #232836; border: 1px solid #333; border-radius: 12px; overflow: hidden; display: block; text-decoration: none; padding: 8px; box-sizing: border-box; }
+  .tile { width: 90px; height: 70px; background: #232836; border-radius: 12px; cursor: pointer; }
+  .abs { position: absolute; top: 6px; right: 6px; width: 28px; height: 28px; }
+  .gap { height: 2600px; }
+  .pe-none { pointer-events: none; }
+  .switch { display: inline-block; width: 44px; height: 24px; border-radius: 999px; background: #445; position: relative; }
+  .switch input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
+  .portal { position: fixed; z-index: 50; background: #2a3040; border: 1px solid #555; padding: 12px; }
+  #drawer { top: 0; right: 0; bottom: 0; width: 260px; }
+  #menu { top: 70px; left: 300px; width: 160px; }
+  .portal > * { display: block; width: 100%; margin-bottom: 8px; padding: 8px; box-sizing: border-box; background: #3a4155; border: 0; text-align: left; text-decoration: none; }
+  #out { position: fixed; left: 8px; bottom: 8px; z-index: 99; max-height: 45vh; overflow: auto; background: rgba(0,0,0,.85); padding: 8px 12px; font: 12px/1.5 ui-monospace, monospace; white-space: pre; pointer-events: none; }
+  .pass { color: #6f6; } .fail { color: #f66; }
+</style>
+
+<div id="root"><div class="shell">
+  <header>
+    <a href="#home" id="nav-home">Home</a>
+    <a href="#play" id="nav-play">Play</a>
+    <button id="open-menu" aria-haspopup="menu">Menu</button>
+    <span style="flex:1"></span>
+    <button id="open-drawer" data-slot="drawer-trigger" aria-label="Open user menu">User</button>
+  </header>
+  <main><div id="scroller">
+
+    <div class="row" id="row-a">
+      <!-- real control filled by another real control: ONE stop (the inner) -->
+      <span role="button" tabindex="0" data-slot="popover-trigger" id="trigger-wrap"><button id="trigger-inner">Create</button></span>
+      <!-- bare cursor-pointer div: the v2 friend tile -->
+      <div class="tile cursor-pointer" id="tile">tile</div>
+      <!-- Base UI switch: visible span, hidden input inside -->
+      <span class="switch" role="switch" tabindex="0" aria-checked="false" id="switch"><input type="checkbox" aria-hidden="true" tabindex="-1"></span>
+      <!-- present but parked -->
+      <button class="pe-none" id="parked">parked</button>
+      <input type="range" id="slider" min="0" max="10" value="5">
+    </div>
+
+    <div class="row" id="row-b">
+      <!-- link card with a small button in the corner: TWO stops -->
+      <a class="card" href="#card" id="card">card <button class="abs" id="card-x">x</button></a>
+      <!-- focus-only wrapper around a control: ONE stop (the inner) -->
+      <div tabindex="0" id="focus-wrap" style="padding:6px"><button id="focus-inner">inner</button></div>
+      <!-- Tools for Autodarts drawer entry: <a> with its href stripped -->
+      <a id="autodarts-tools-menu-item" style="cursor: pointer; padding: 8px">Tools</a>
+      <tfa-host id="host"></tfa-host>
+    </div>
+
+    <div class="gap">long stretch of plain text, nothing to select</div>
+
+    <div class="row" id="row-z">
+      <button id="bottom-1">bottom one</button>
+      <button id="bottom-2">bottom two</button>
+    </div>
+  </div></main>
+</div></div>
+
+<div id="out"></div>
+
+<script>
+  // Shadow root, as createShadowRootUi() makes for the extension's settings UI.
+  const sr = document.getElementById('host').attachShadow({ mode: 'open' });
+  sr.innerHTML = '<button id="s1">shadow one</button> <button id="s2">shadow two</button>';
+
+  // ---- Base UI look-alikes: portalled, focus moves in on open and back on close
+  let lastTrigger = null;
+  function openPortal(id, html, attrs, modal) {
+    const el = document.createElement('div');
+    el.id = id; el.className = 'portal'; el.tabIndex = -1; el.innerHTML = html;
+    for (const k in attrs) el.setAttribute(k, attrs[k]);
+    document.body.appendChild(el);
+    if (modal) document.getElementById('root').setAttribute('aria-hidden', 'true');
+    el.focus();
+    return el;
+  }
+  function closePortal(id) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.remove();
+    document.getElementById('root').removeAttribute('aria-hidden');
+    if (lastTrigger) lastTrigger.focus();
+  }
+  document.getElementById('open-drawer').addEventListener('click', e => {
+    lastTrigger = e.currentTarget;
+    openPortal('drawer', '<a href="#settings" id="d1" data-slot="item">Settings</a><a href="#boards" id="d2" data-slot="item">Devices</a><button id="d3">Logout</button>',
+      { role: 'dialog', 'data-slot': 'drawer-content' }, true);
+  });
+  document.getElementById('open-menu').addEventListener('click', e => {
+    lastTrigger = e.currentTarget;
+    openPortal('menu', '<button role="menuitem" id="m1">One</button><button role="menuitem" id="m2">Two</button>', { role: 'menu' }, false);
+  });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') { closePortal('drawer'); closePortal('menu'); } });
+</script>
+<script src="../app/src/main/assets/spatialnav.js"></script>
+<script>
+(async function () {
+  const A = window.__adnav;
+  const $ = id => document.getElementById(id) || sr.getElementById(id);
+  const cur = () => { const c = A.current(); return c ? c.id : null; };
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  // Dispatched at the focused element, as a real key press is.
+  const key = k => { const ev = new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true, composed: true }); (document.activeElement || document.body).dispatchEvent(ev); return ev; };
+  const go = (from, ...dirs) => { A.focus($(from)); A.refresh(); for (const d of dirs) { A.move(d); A.refresh(); } return cur(); };
+  const scroller = $('scroller');
+  const results = [];
+  const check = (name, ok, detail) => results.push({ name, ok: !!ok, detail: ok ? '' : String(detail) });
+
+  await sleep(900);
+
+  // ---- first pick
+  check('first highlight is the first content item, not the header', cur() === 'trigger-inner', cur());
+
+  // ---- what is and is not a stop
+  const stops = () => { A.refresh(); return A.candidates().concat(A.current() ? [A.current()] : []).map(e => e.id); };
+  let s = stops();
+  check('wrapper filled by a control is not a second stop', !s.includes('trigger-wrap') && s.includes('trigger-inner'), s);
+  check('bare cursor-pointer div is a stop', s.includes('tile'), s);
+  check('switch with a hidden input inside is a stop', s.includes('switch'), s);
+  check('pointer-events:none control is not a stop', !s.includes('parked'), s);
+  check('link card AND its corner button are both stops', s.includes('card') && s.includes('card-x'), s);
+  check('focus-only wrapper yields to the control inside', !s.includes('focus-wrap') && s.includes('focus-inner'), s);
+  check('Tools for Autodarts entry (href-less <a>) is a stop', s.includes('autodarts-tools-menu-item'), s);
+  check('controls inside a shadow root are stops', s.includes('s1') && s.includes('s2'), s);
+
+  // ---- the highlight does not touch the target
+  const x = $('card-x');
+  const before = { left: x.offsetLeft, top: x.offsetTop, cls: x.className, pos: getComputedStyle(x).position };
+  A.focus(x);
+  check('highlighting an absolutely positioned button leaves it where it was',
+    x.offsetLeft === before.left && x.offsetTop === before.top && getComputedStyle(x).position === before.pos, 'moved');
+  check('highlighting adds no class to the target', x.className === before.cls, x.className);
+  x.className = 'abs re-rendered';             // what React does on every render
+  await sleep(50);
+  check('highlight survives the framework rewriting className', cur() === 'card-x' && getComputedStyle($('__adnav_ring')).display === 'block', cur());
+
+  // ---- plain movement
+  check('right along a row', go('trigger-inner', 'right') === 'tile', cur());
+  check('down into the next row', ['card', 'card-x'].includes(go('trigger-inner', 'down')), cur());
+  check('into the shadow root and across it', go('autodarts-tools-menu-item', 'right') === 's1' && go('s1', 'right') === 's2', cur());
+  check('right at the end of a row does not scroll the page sideways', (go('s2', 'right'), scroller.scrollLeft === 0 && scrollX === 0), 'scrolled');
+
+  // ---- activation
+  let clicked = '';
+  $('tile').addEventListener('click', () => clicked = 'tile');
+  A.focus($('tile')); key('Enter');
+  check('Enter clicks a cursor-pointer div', clicked === 'tile', clicked);
+  sr.getElementById('s2').addEventListener('click', () => clicked = 's2');
+  A.focus($('s2')); key('Enter');
+  check('Enter clicks inside a shadow root', clicked === 's2', clicked);
+
+  // ---- slider keeps left/right for itself
+  A.focus($('slider'));
+  const evL = key('ArrowRight');
+  check('left/right on a slider are passed through, not swallowed', !evL.defaultPrevented && cur() === 'slider', cur());
+  check('up/down still leave a slider', (key('ArrowDown'), cur() !== 'slider'), cur());
+  if (document.activeElement) document.activeElement.blur();
+
+  // ---- long page: scroll through a gap with nothing to select
+  scroller.scrollTop = 0;
+  A.focus($('s2')); A.refresh();
+  let presses = 0;
+  while (!/^bottom/.test(cur() || '') && presses < 30) { A.move('down'); A.refresh(); presses++; }
+  check('down through a long gap reaches the bottom of the page', /^bottom/.test(cur() || ''), cur() + ' after ' + presses + ' presses');
+  check('...without ever jumping into the fixed header', !/^nav-|^open-/.test(cur() || ''), cur());
+  presses = 0;
+  while (scroller.scrollTop > 0 && presses < 30) { A.move('up'); A.refresh(); presses++; }
+  check('and up comes back to the top', scroller.scrollTop === 0, 'scrollTop=' + scroller.scrollTop);
+
+  // ---- from the header, down scrolls the content even though the header itself cannot scroll
+  scroller.scrollTop = 600;                      // row-a/b scrolled away, bottom rows far below
+  await sleep(20);
+  A.focus($('nav-home')); A.refresh();
+  const st0 = scroller.scrollTop;
+  A.move('down');
+  check('from the header, a dead-end press scrolls the content area', cur() !== 'nav-home' || scroller.scrollTop !== st0, 'stuck');
+  scroller.scrollTop = 0;
+
+  // ---- drawer: modal, portalled, far from its trigger
+  A.focus($('open-drawer')); key('Enter');
+  await sleep(350);
+  check('opening a drawer moves the highlight into it', ['d1', 'd2', 'd3'].includes(cur()), cur());
+  check('an open drawer counts as one overlay', A.overlays() === 1, A.overlays());
+  const seen = new Set();
+  for (const k of ['ArrowDown', 'ArrowDown', 'ArrowDown', 'ArrowDown', 'ArrowLeft', 'ArrowLeft', 'ArrowUp', 'ArrowUp', 'ArrowUp', 'ArrowRight']) { key(k); seen.add(cur()); }
+  check('the D-pad cannot leave an open drawer', [...seen].every(id => ['d1', 'd2', 'd3'].includes(id)), [...seen]);
+  key('Escape');                                 // what BACK sends, via MainActivity
+  await sleep(200);
+  check('closing it returns the highlight to the trigger', cur() === 'open-drawer', cur());
+  check('and no overlay is left', A.overlays() === 0, A.overlays());
+
+  // ---- menu: not modal, may be left once its edge is reached
+  A.focus($('open-menu')); key('Enter');
+  await sleep(350);
+  check('opening a menu moves the highlight into it', ['m1', 'm2'].includes(cur()), cur());
+  A.focus($('m1')); key('ArrowDown');
+  check('inside a menu, movement prefers its own items', cur() === 'm2', cur());
+  key('Escape'); await sleep(200);
+  check('closing the menu returns to its trigger', cur() === 'open-menu', cur());
+
+  // ---- re-render: the highlighted element is destroyed and rebuilt
+  A.focus($('bottom-2')); await sleep(30);
+  const pos = $('bottom-2').getBoundingClientRect();
+  const row = $('row-z'); row.replaceWith(row.cloneNode(true));
+  await sleep(250);
+  const now = A.current() ? A.current().getBoundingClientRect() : null;
+  check('a re-render keeps the highlight in place', now && Math.abs(now.left - pos.left) + Math.abs(now.top - pos.top) < 2, cur());
+
+  // ---- report
+  const failed = results.filter(r => !r.ok);
+  document.getElementById('out').innerHTML = results.map(r =>
+    '<span class="' + (r.ok ? 'pass' : 'fail') + '">' + (r.ok ? 'PASS' : 'FAIL') + '  ' + r.name + (r.ok ? '' : '   -> ' + r.detail) + '</span>').join('\n') +
+    '\n\n' + (failed.length ? failed.length + ' FAILED' : 'ALL ' + results.length + ' PASS');
+  window.__navtest = { total: results.length, failed: failed.map(r => r.name + ' -> ' + r.detail) };
+})();
+</script>

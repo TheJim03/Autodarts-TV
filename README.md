@@ -15,8 +15,9 @@ Autodarts runs great on a Raspberry Pi at the board, and the web app is the natu
 ## Features
 
 - **Leanback launcher entry** — appears directly on the Android TV home screen, one click to start
-- **Persistent login** — cookies and localStorage (Keycloak tokens) survive restarts; log in once and never again
-- **Focus navigation** — the D-pad jumps between clickable elements, the selected one is highlighted with a white glow, OK clicks it
+- **Persistent login** — cookies and localStorage survive restarts; log in once and never again
+- **Focus navigation** — the D-pad jumps between clickable elements, the selected one is highlighted with a white ring, OK clicks it
+- **Drawers, dialogs and menus** — the highlight follows them when they open, stays inside while they are open, and BACK closes them
 - **Smart directional search** — pressing *up* really goes up: same-column/row elements are preferred, with a 45° cone as fallback
 - **Auto-scroll** — if there's nothing further in the pressed direction, the page scrolls and the search continues, so the very top and bottom of long pages stay reachable (works with virtualized lists too)
 - **Cursor fallback** — press MENU to toggle a free-moving virtual mouse cursor for anything the focus navigation can't reach
@@ -28,7 +29,7 @@ Autodarts runs great on a Raspberry Pi at the board, and the web app is the natu
 |---|---|
 | D-pad | Move the highlight to the nearest element in that direction |
 | OK / Enter | Click the highlighted element (focuses text fields → on-screen keyboard) |
-| BACK | Navigate back in the web app (doesn't close the app) |
+| BACK | Close whatever is open (drawer, dialog, menu); otherwise navigate back in the web app |
 | MENU | Toggle between focus navigation and free cursor mode |
 
 In text fields: left/right move the caret, up/down leave the field and resume navigation.
@@ -66,26 +67,32 @@ No ADB? Copy the APK over with an app like *Send Files to TV*, then install it w
 
 ## First start
 
-You'll land on the Autodarts (Keycloak) login. Select the fields with the D-pad — OK opens the on-screen keyboard. Tip: the *Google TV Remote* app on your phone has a proper keyboard, which makes this one-time login much more pleasant. After that the session persists indefinitely.
+You'll land on the Autodarts welcome screen; choose *Anmelden / Sign in* and log in with **email or username and password**. Select the fields with the D-pad — OK opens the on-screen keyboard. *Continue with Google* will not work here: Google refuses sign-ins from embedded WebViews, and this app does not try to get around that — if your account only has a Google or Apple login, set a password for it on a computer first. Tip: the *Google TV Remote* app on your phone has a proper keyboard, which makes this one-time login much more pleasant. After that the session persists indefinitely.
 
 ## Customizing
 
 - **Start URL**: `START_URL` in [`MainActivity.kt`](app/src/main/java/io/autodarts/tv/MainActivity.kt) — point it directly at your board or match view, e.g. `https://play.autodarts.com/boards/<board-id>/follow`
-- **Highlight style**: the CSS block at the top of [`spatialnav.js`](app/src/main/assets/spatialnav.js)
-- **Clickable element detection**: the `SELECTOR` list in `spatialnav.js`, in case some element isn't picked up
+- **Highlight style**: the `#__adnav_ring` rule in [`spatialnav.js`](app/src/main/assets/spatialnav.js)
+- **Clickable element detection**: the `STRONG` / `HEURISTIC` lists in `spatialnav.js`, in case some element isn't picked up
 - **Cursor speed** (fallback mode): constants in [`CursorLayout.kt`](app/src/main/java/io/autodarts/tv/CursorLayout.kt)
 
-Quick iteration tip: paste the contents of `spatialnav.js` into the DevTools console on play.autodarts.com in a desktop browser — the arrow keys behave exactly like the D-pad on the TV, no rebuild needed.
+Quick iteration tip: paste the contents of `spatialnav.js` into the DevTools console on play.autodarts.com in a desktop browser — the arrow keys behave exactly like the D-pad on the TV, no rebuild needed. For changes to the navigation itself there is a regression page: serve the repository root (`python -m http.server`) and open `tools/navtest.html`.
 
 ## How it works
 
 The app is a single Activity hosting a WebView. After each page load it injects `spatialnav.js`, which:
 
-1. collects all clickable elements (`button`, `a[href]`, `[role="button"]`, inputs, …)
-2. on every arrow key press, runs a three-pass geometric search (same column/row → 45° cone → half-plane) to find the nearest element in that direction
-3. highlights it, scrolls it into view, and clicks it on Enter via `el.click()` (which triggers React handlers)
+1. collects everything clickable: real controls (`button`, `a[href]`, ARIA roles, inputs, …) and things that only *look* clickable — Autodarts Play has many bare `<div class="cursor-pointer">`
+2. on every arrow key press, runs a three-pass geometric search (same column/row → 45° cone → half-plane) to find the nearest element in that direction, skipping anything covered by an overlay or scrolled out of its container
+3. lays a highlight ring over it, scrolls it into view, and clicks it on Enter via `el.click()`
 
-A `MutationObserver` re-picks a highlight when the current element disappears (route changes, dialogs), and the script survives SPA navigation since it's injected once per document.
+Autodarts Play (rebuilt in 2026 on Tailwind + shadcn/ui + Base UI) shapes three decisions:
+
+- **The highlight is its own element, not a class on the target.** React rewrites `className` on every re-render and would drop it; the ring also cannot be clipped by a card's `overflow: hidden` and does not disturb absolutely positioned buttons.
+- **Popups are found by focus, not geometry.** Drawers, dialogs and menus render in portals at the end of `<body>`, far from their trigger. The page moves DOM focus into them when they open, and the highlight follows; while a modal is open the D-pad cannot leave it. Layers that fill the screen without declaring themselves modal (the extension's own dialogs) are treated the same way.
+- **The page does not scroll, a container inside `<main>` does**, under a fixed header. Searches start from what is visible of the current element, and a press with nothing in range scrolls that container.
+
+A `MutationObserver` re-picks the highlight when the current element disappears — near where it was after a re-render, at the first content item after a route change.
 
 ## Troubleshooting
 
@@ -134,13 +141,19 @@ A shim is sufficient because both bootstraps inside the built bundle only test
 that `runtime.id` is truthy and then adopt the object as-is, promise-based, with
 no callback wrapping. A promise-returning stand-in is accepted unchanged.
 
-Four things had to be bridged:
+These had to be bridged:
 
-- **`runtime.sendMessage`** — all 8 call sites send `{ type: "fetch", url, options }`.
-  The service worker only ever existed to dodge CORS; OkHttp has no CORS. Answers
-  use the upstream contract `{ ok, status, statusText, data, error }`, where `data`
-  is a *data: URL*, not bare base64. `@JavascriptInterface` methods are synchronous,
-  so calls carry a callback id and Kotlin answers via `window.__tfaResolve(id, json)`.
+- **`runtime.sendMessage`** — the service worker is replaced, so every message type
+  it answered is answered by `tfa-shim.js` instead. As of 3.4.0 there are four:
+  - `fetch` — a CORS-free HTTP request, done by OkHttp in `TfaBridge.kt`. Answers use
+    the upstream contract `{ ok, status, statusText, data, error }`, where `data` is a
+    *data: URL*, not bare base64.
+  - `teams:reorder-lease` — "one tab at a time per lobby". A WebView is one tab; granted.
+  - `teams:undo-visit` — undo a visit and pass the turn, exactly once. Ported into the shim.
+  - `wled:upload` — one file onto a WLED controller, as multipart, by `TfaBridge.kt`.
+
+  `@JavascriptInterface` methods are synchronous, so calls carry a callback id and
+  Kotlin answers via `window.__tfaResolve(id, json)`.
 - **`runtime.getURL`** — 27 static paths. Strategy is switchable at one place
   (`STRATEGY` in `tfa-shim.js`): `assetloader` (default) or `blob`. `play.autodarts.com`
   sends **no CSP header and carries no CSP meta tag** (verified 2026-08-29), so the
@@ -153,7 +166,17 @@ Four things had to be bridged:
   `websocket-capture.js` as `<script src>` to escape the isolated world. We are
   already in the main world, so both are run inline by `MainActivity` and their
   `getURL()` is redirected to an empty `__noop.js`, otherwise `window.WebSocket`
-  would get patched twice.
+  would get patched twice. `quiet-own-darts.js` (3.x) is injected on demand and
+  guards itself, so it simply loads through the asset loader.
+
+### Plain http, for WLED only
+
+WLED controllers speak plain http, and the extension reaches them through the
+bridge. `usesCleartextTraffic` is therefore on — an app-wide switch, so the real
+limits are in code: `TfaBridge` refuses http to anything that is not a
+local-network address (`cleartextRefusal()`), and `MainActivity` refuses to load
+any non-https page into the WebView. If you do not use WLED you can set the
+manifest flag back to `false`; only the WLED features stop working.
 
 ### Two things that fail silently
 
@@ -166,11 +189,13 @@ Worth knowing before debugging:
    adds the header, and `tfa-shim.js` additionally intercepts `fetch()` for asset
    URLs and serves them straight from the bridge, so the CSS does not depend on
    CORS at all.
-2. **A new upstream API.** The shim covers four API points. If a future release
-   reaches for a fifth, MV3 APIs return `undefined` rather than throwing, and the
-   feature just quietly does nothing. `tools/tfa-build.mjs` therefore scans the
-   built content scripts for `browser.*`/`chrome.*` usage after every build and
-   **fails the build** on anything not in its `SHIMMED_APIS` list.
+2. **Something new upstream.** A missing extension API returns `undefined` rather
+   than throwing, an unanswered message type resolves to nothing, and a new
+   main-world script just never runs — in each case the feature quietly does
+   nothing. `tools/tfa-build.mjs` therefore checks all three after every build
+   (`SHIMMED_APIS`, `SHIMMED_MESSAGES`, `MAIN_WORLD_SCRIPTS`) and **fails the
+   build** on anything it does not know. The 2.4.0 → 3.4.0 update added three
+   message types and one script; that is how they were found.
 
 ### Checking the shim without a TV
 
@@ -204,16 +229,19 @@ lost the race with the document swap.
 `addJavascriptInterface` attaches to *every* page the WebView loads, and
 `fetchProxy` is a CORS-free proxy that will attach the user's cookies. So
 `TfaBridge` tracks the current document's host and refuses both of its methods
-anywhere other than `play.autodarts.com` — the Keycloak login page and anything
-reached through an outbound link get nothing.
+anywhere other than `play.autodarts.com` — anything reached through an outbound
+link gets nothing.
 
 ### Remote control in the settings panel
 
 The settings UI mounts into a shadow root (`createShadowRootUi`, host element
 `<autodarts-tools-wxt>`). A plain `querySelectorAll` sees nothing inside it, so
-`spatialnav.js` now descends into open shadow roots when collecting focusable
-elements — and stamps its highlight CSS into each one, since styles do not cross
-shadow boundaries.
+`spatialnav.js` descends into open shadow roots when collecting focusable
+elements, and hit-tests inside them too: the extension's own dialogs carry no
+dialog role, so the only way to know one is open is that it covers the screen.
+
+The entry point moved with the redesign: it is now **Tools for Autodarts** in the
+user drawer (avatar, top right), no longer a tab in a sidebar.
 
 ### Verifying on device
 

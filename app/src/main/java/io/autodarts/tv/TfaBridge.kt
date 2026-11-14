@@ -6,21 +6,24 @@ import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.net.URI
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
  * Replaces the MV3 service worker of "Tools for Autodarts".
  *
- * The upstream background script exists for exactly two reasons: it proxies
- * fetches to dodge CORS, and it serves packed extension assets. Neither problem
- * exists here — OkHttp has no CORS, and the assets sit in the APK — so the whole
- * worker collapses into these two methods.
+ * The upstream background script proxies fetches to dodge CORS, serves packed
+ * extension assets, and (since 3.x) uploads animation packs to a WLED on the
+ * LAN. OkHttp has no CORS and the assets sit in the APK, so all of that
+ * collapses into the three methods here. The remaining message types the
+ * worker answers need no native code and live in tfa-shim.js.
  *
  * Exposed to JS as `TfaBridge`. Every method is called from the WebView's JS
  * thread and must return immediately, so anything with I/O takes a callback id
@@ -107,6 +110,14 @@ class TfaBridge(private val webView: WebView, private val allowedHost: String) {
         val method = options.optString("method", "GET").uppercase()
         val bodyText = if (options.isNull("body")) null else options.optString("body")
 
+        cleartextRefusal(url)?.let { return JSONObject().put("ok", false).put("error", it) }
+
+        // Upstream lets a caller bound how long the worker waits (its WLED
+        // probes do, so an address nobody answers on fails in seconds, not a
+        // minute). tfa-shim.js tucks that into the options as __timeoutMs.
+        val timeoutMs = options.optLong("__timeoutMs", 0L)
+        val client = clientFor(timeoutMs)
+
         val builder = Request.Builder().url(url)
 
         var contentType: String? = null
@@ -134,7 +145,7 @@ class TfaBridge(private val webView: WebView, private val allowedHost: String) {
         }
         builder.method(method, requestBody)
 
-        http.newCall(builder.build()).execute().use { response ->
+        client.newCall(builder.build()).execute().use { response ->
             val bytes = response.body?.bytes() ?: ByteArray(0)
             val mime = response.body?.contentType()?.toString()
                 ?: response.header("Content-Type")
@@ -153,6 +164,109 @@ class TfaBridge(private val webView: WebView, private val allowedHost: String) {
             }
             return out
         }
+    }
+
+    // ------------------------------------------------------------------ WLED
+
+    /**
+     * Answers `browser.runtime.sendMessage({ type: "wled:upload", ... })`: puts
+     * one file on a WLED controller, the way WLED's own settings page does —
+     * multipart POST to /upload, field `data`, the file's name with its slash.
+     *
+     * What may be sent is decided in tfa-shim.js with upstream's own checks (a
+     * GIF from the bundled catalog under its own name, or a presets.json that
+     * is a JSON object — never a cfg.json, which WLED would apply and reboot
+     * with). The checks are repeated here because this method is reachable
+     * from any script in the page, not only from the shim.
+     *
+     * Resolves with upstream's contract: { ok, status?, error? }.
+     */
+    @JavascriptInterface
+    fun wledUpload(callbackId: String, origin: String, name: String, gif: String, text: String, timeoutMs: Double) {
+        if (!allowed()) {
+            resolve(callbackId, JSONObject().put("ok", false).put("error", "refused").toString())
+            return
+        }
+        io.execute {
+            val result = try {
+                doWledUpload(origin, name, gif, text, timeoutMs.toLong())
+            } catch (e: Exception) {
+                Log.w(TAG, "wledUpload failed for $origin$name", e)
+                JSONObject().put("ok", false).put("error", e.message ?: e.javaClass.simpleName)
+            }
+            resolve(callbackId, result.toString())
+        }
+    }
+
+    private fun doWledUpload(origin: String, name: String, gif: String, text: String, timeoutMs: Long): JSONObject {
+        fun refuse(why: String) = JSONObject().put("ok", false).put("error", why)
+
+        if (!WLED_NAME.matches(name) || name.contains("..")) return refuse("not a file name WLED keeps")
+        val target = "${origin.trimEnd('/')}/upload"
+        cleartextRefusal(target)?.let { return refuse(it) }
+
+        val (bytes, mime) = if (gif.isNotEmpty()) {
+            if (!WLED_GIF.matches(gif) || name != "/$gif") return refuse("not a GIF of the catalog")
+            val data = try {
+                webView.context.assets.open("tfa/wled-packs/gifs/$gif").use { it.readBytes() }
+            } catch (e: Exception) {
+                return refuse("the catalog has no $gif")
+            }
+            data to "image/gif"
+        } else {
+            if (name != "/presets.json") return refuse("not a presets.json")
+            if (runCatching { JSONObject(text) }.isFailure) return refuse("not a presets.json")
+            text.toByteArray(Charsets.UTF_8) to "application/json"
+        }
+
+        val form = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("data", name, bytes.toRequestBody(mime.toMediaTypeOrNull()))
+            .build()
+        val request = Request.Builder().url(target).post(form).header("Cache-Control", "no-store").build()
+
+        clientFor(if (timeoutMs > 0) timeoutMs else 20_000L).newCall(request).execute().use { response ->
+            return JSONObject().put("ok", response.isSuccessful).put("status", response.code)
+        }
+    }
+
+    // ------------------------------------------------------------- cleartext
+
+    /** The shared client, or one bounded to [timeoutMs] for the whole call. */
+    private fun clientFor(timeoutMs: Long): OkHttpClient =
+        if (timeoutMs > 0) http.newBuilder().callTimeout(timeoutMs, TimeUnit.MILLISECONDS).build() else http
+
+    /**
+     * Plain http:// is allowed for one purpose only: talking to a device on
+     * the local network. WLED controllers speak nothing else, and the
+     * extension's WLED features are dead without it — but the manifest switch
+     * that permits it (usesCleartextTraffic) is app-wide, so the actual limit
+     * has to be enforced here. Returns why a URL is refused, or null if fine.
+     */
+    private fun cleartextRefusal(url: String): String? {
+        val uri = runCatching { URI(url) }.getOrNull() ?: return "not an address"
+        if (!uri.scheme.equals("http", ignoreCase = true)) return null
+        val host = uri.host ?: return "not an address"
+        return if (isLanHost(host)) null else "plain http is only allowed to devices on the local network"
+    }
+
+    private fun isLanHost(rawHost: String): Boolean {
+        val host = rawHost.trim('[', ']').lowercase()
+        IPV4.matchEntire(host)?.let { m ->
+            val (a, b) = m.groupValues.drop(1).map { it.toInt() }
+            return a == 10 || a == 127 ||
+                (a == 172 && b in 16..31) ||
+                (a == 192 && b == 168) ||
+                (a == 169 && b == 254)
+        }
+        if (host.contains(':')) {
+            // IPv6: unique-local fc00::/7, link-local fe80::/10, loopback.
+            return host.startsWith("fc") || host.startsWith("fd") ||
+                host.startsWith("fe8") || host.startsWith("fe9") ||
+                host.startsWith("fea") || host.startsWith("feb") || host == "::1"
+        }
+        // Names only a local resolver answers: mDNS, router-assigned, bare.
+        return !host.contains('.') || LAN_SUFFIXES.any { host.endsWith(it) }
     }
 
     // ---------------------------------------------------------------- assets
@@ -209,5 +323,13 @@ class TfaBridge(private val webView: WebView, private val allowedHost: String) {
         const val NAME = "TfaBridge"
         private const val TAG = "TfaBridge"
         private val METHODS_REQUIRING_BODY = setOf("POST", "PUT", "PATCH")
+
+        // Same patterns as upstream utils/wled-upload.ts. LittleFS keeps 31
+        // characters of a path, the slash included.
+        private val WLED_NAME = Regex("^/[\\w.-]{1,30}$")
+        private val WLED_GIF = Regex("^[\\w.-]+\\.gif$", RegexOption.IGNORE_CASE)
+
+        private val IPV4 = Regex("^(\\d{1,3})\\.(\\d{1,3})\\.\\d{1,3}\\.\\d{1,3}$")
+        private val LAN_SUFFIXES = listOf(".local", ".lan", ".home", ".home.arpa", ".fritz.box", ".internal")
     }
 }
