@@ -594,16 +594,25 @@
   var style = document.createElement('style');
   style.id = '__adnav_style';
   style.textContent =
-    '@keyframes __adnav_pulse {' +
-    '  0%,100% { box-shadow: 0 0 0 1px rgba(0,0,0,.55), 0 0 10px 3px rgba(255,255,255,.55); }' +
-    '  50%     { box-shadow: 0 0 0 1px rgba(0,0,0,.55), 0 0 18px 6px rgba(255,255,255,.8); }' +
-    '}' +
+    // The pulse animates OPACITY of a glow layer, never box-shadow. A
+    // box-shadow animation has to be repainted on the main thread every frame
+    // for as long as the ring is shown — on a Fire TV Stick that is a constant
+    // tax on the same thread that handles thrown darts and the caller. An
+    // opacity animation on its own layer runs on the compositor alone.
+    '@keyframes __adnav_glow { 0%,100% { opacity: .35; } 50% { opacity: 1; } }' +
     '#__adnav_ring {' +
     '  position: fixed; left: 0; top: 0; margin: 0; padding: 0;' +
     '  box-sizing: border-box; pointer-events: none; display: none;' +
     '  border: 2px solid rgba(255,255,255,.95); border-radius: 8px;' +
-    '  animation: __adnav_pulse 1.6s ease-in-out infinite;' +
+    '  box-shadow: 0 0 0 1px rgba(0,0,0,.55), 0 0 10px 3px rgba(255,255,255,.45);' +
+    '  will-change: transform;' +
     '  z-index: 2147483647;' +
+    '}' +
+    '#__adnav_ring::after {' +
+    '  content: ""; position: absolute; inset: -2px; border-radius: inherit;' +
+    '  box-shadow: 0 0 18px 6px rgba(255,255,255,.75);' +
+    '  animation: __adnav_glow 1.6s ease-in-out infinite;' +
+    '  will-change: opacity;' +
     '}';
   (document.head || document.documentElement).appendChild(style);
 
@@ -639,7 +648,7 @@
    */
   function updateRing(glide) {
     if (!ring.isConnected) document.documentElement.appendChild(ring);
-    if (!current || !current.isConnected) {
+    if (asleep || !current || !current.isConnected) {
       if (ringKey !== '') { ring.style.display = 'none'; ringKey = ''; }
       return;
     }
@@ -677,6 +686,7 @@
   }
 
   function follow(ms) {
+    if (asleep) return;
     followUntil = Math.max(followUntil, Date.now() + (ms || 600));
     if (!rafId) rafId = window.requestAnimationFrame(tick);
   }
@@ -688,6 +698,7 @@
   // Safety net for moves nothing announced, and for when the WebView is not
   // painting (requestAnimationFrame is paused in the background).
   setInterval(function () {
+    if (asleep) return;
     if (current && current.isConnected) ringClip = clipAncestorsOf(current);
     updateRing(false);
   }, 500);
@@ -904,6 +915,20 @@
     var dir = KEYMAP[ev.key];
     var active = deepActiveElement();
 
+    var wasAsleep = asleep;
+    noteActivity();
+    if (wasAsleep) {
+      wake(true);
+      // The first press after a pause only brings the highlight back, where it
+      // was. The ring has been hidden, so moving it — or worse, clicking
+      // whatever it sits on — would act on something the user cannot see.
+      if (!isTextInput(active) && (dir || ev.key === 'Enter')) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        return;
+      }
+    }
+
     // While typing in a text field: left/right move the caret,
     // up/down leave the field and resume navigation.
     if (isTextInput(active)) {
@@ -972,6 +997,14 @@
     var path = ev.composedPath ? ev.composedPath() : null;
     var target = (path && path[0]) || ev.target;
     if (!target || target === current || target.nodeType !== 1) return;
+    if (asleep) {
+      // While nobody is using the remote, the page moving focus around is not
+      // our business — except a popup taking it. That is the end-of-match
+      // dialog with Rematch on it: have the highlight ready there.
+      if (!popupOf(target)) return;
+      noteActivity();
+      wake(false);
+    }
     adoptFocus(target, 0);
   }, true);
 
@@ -1037,13 +1070,110 @@
     }, 60);
   });
 
+  var observedRoots = [];
+
   function observe(root) {
     if (!mo || !root || root.__adnav_observed) return;
     root.__adnav_observed = true;
-    mo.observe(root, { childList: true, subtree: true });
+    observedRoots.push(root);
+    if (!asleep) mo.observe(root, { childList: true, subtree: true });
   }
 
   observe(document.documentElement);
+
+  // ---------- idle ----------
+  // Everything above earns its keep while someone is using the remote. During
+  // a match nobody is: darts are being thrown, and the page re-renders on every
+  // one of them. Left running, the observer, the re-pick and the ring tracking
+  // spend that time on the main thread — the same thread that has to process
+  // the dart, update the score and start the caller. On a Fire TV Stick that
+  // was enough to make matches stall and calls go missing (issue #4).
+  //
+  // So after a few seconds without a key, navigation goes to sleep: observer
+  // disconnected, ring hidden, timers idle. The next key press wakes it, and a
+  // popup taking focus does too (the end-of-match dialog). While asleep the
+  // script costs nothing at all.
+
+  var IDLE_MS = 10000;
+  var asleep = false;
+  var idleTimer = null;
+
+  function noteActivity() {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(sleep, IDLE_MS);
+  }
+
+  // The one thing still watched while asleep: popups. They mount as direct
+  // children of <body>, while the page itself re-renders inside #root, so a
+  // childList observer on <body> alone sees them and nothing else — near-zero
+  // cost during a match. Focus events would be enough on a TV, but they do not
+  // fire in a document that lacks system focus, so they are not relied on.
+  var portalTimer = null;
+  var portalWatch = new MutationObserver(function () {
+    if (!asleep || portalTimer) return;
+    portalTimer = setTimeout(function () {      // popups animate in
+      portalTimer = null;
+      if (!asleep) return;
+      var popups = document.querySelectorAll(STRICT_POPUP_SELECTOR + ',[role="menu"],[role="listbox"]');
+      var popup = null;
+      for (var i = popups.length - 1; i >= 0 && !popup; i--) if (isVisible(popups[i])) popup = popups[i];
+      if (!popup) return;
+      noteActivity();
+      wake(false);
+      var active = deepActiveElement();
+      adoptFocus(active && deepContains(popup, active) ? active : popup, 0);
+    }, 150);
+  });
+
+  function sleep() {
+    if (asleep) return;
+    asleep = true;
+    idleTimer = null;
+    mo.disconnect();
+    if (document.body) portalWatch.observe(document.body, { childList: true });
+    if (recheck) { clearTimeout(recheck); recheck = null; }
+    followUntil = 0;
+    if (rafId) { window.cancelAnimationFrame(rafId); rafId = 0; }
+    ring.style.display = 'none';
+    ringKey = '';
+  }
+
+  /**
+   * Resume. Whatever happened meanwhile went unobserved, so the cache is
+   * thrown away and the highlight checked: kept if it is still there, else
+   * re-picked near where it was (or at the top of a screen that has changed).
+   * `repick` is false when the caller is about to set the highlight itself.
+   */
+  function wake(repick) {
+    if (!asleep) return;
+    asleep = false;
+    portalWatch.disconnect();
+    if (portalTimer) { clearTimeout(portalTimer); portalTimer = null; }
+    dirty = true;
+    cacheTime = 0;
+    var keep = [];
+    for (var i = 0; i < observedRoots.length; i++) {
+      var root = observedRoots[i];
+      var alive = root === document.documentElement || (root.host && root.host.isConnected);
+      if (!alive) { root.__adnav_observed = false; continue; }
+      mo.observe(root, { childList: true, subtree: true });
+      keep.push(root);
+    }
+    observedRoots = keep;
+    var navigated = location.href !== lastHref;
+    lastHref = location.href;
+    if (repick === false) return;
+    var scope = activeScope();
+    var next = current;
+    if (!next || !isVisible(next) || !deepContains(scope, next)) {
+      next = (scope !== document && pickFirst(scope)) ||
+             (navigated ? pickFirst(null) : pickNear(lastPos)) ||
+             pickFirst(null);
+    }
+    setCurrent(next);
+  }
+
+  noteActivity();
 
   /**
    * Highlight the first item of a new screen, once it has one.
@@ -1111,10 +1241,15 @@
     return n;
   };
 
+  /** Calls from outside count as use, exactly like a key press would. */
+  function markActive() { noteActivity(); wake(false); }
+
   api.current = function () { return current; };
-  api.move = move;
-  api.activate = function () { activate(current); };
-  api.focus = function (el) { setCurrent(el); };
+  api.move = function (dir) { markActive(); move(dir); };
+  api.activate = function () { markActive(); activate(current); };
+  api.focus = function (el) { markActive(); setCurrent(el); };
+  api.sleep = sleep;
+  api.asleep = function () { return asleep; };
   api.candidates = function () { return candidates(null); };
   api.refresh = function () { dirty = true; cacheTime = 0; };
   api.pickFirst = function () { return pickFirst(null); };

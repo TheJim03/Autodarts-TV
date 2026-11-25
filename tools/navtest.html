@@ -230,6 +230,26 @@
   const now = A.current() ? A.current().getBoundingClientRect() : null;
   check('a re-render keeps the highlight in place', now && Math.abs(now.left - pos.left) + Math.abs(now.top - pos.top) < 2, cur());
 
+  // ---- idle: nothing runs while nobody uses the remote (issue #4)
+  const ring = $('__adnav_ring');
+  A.focus($('tile')); await sleep(30);
+  A.sleep();
+  check('going idle hides the highlight', getComputedStyle(ring).display === 'none' && A.asleep(), getComputedStyle(ring).display);
+  const idleTile = $('tile');
+  const rowA = $('row-a'); rowA.replaceWith(rowA.cloneNode(true));   // a re-render while asleep
+  await sleep(250);
+  check('while idle, a re-render is not acted on', A.current() === idleTile && A.asleep(), cur());
+  const firstPress = key('ArrowRight');
+  check('the first key after a pause wakes navigation', !A.asleep() && getComputedStyle(ring).display === 'block', getComputedStyle(ring).display);
+  check('...and only brings the highlight back, without moving or clicking', firstPress.defaultPrevented && $('tile') && cur() === 'tile', cur());
+  key('ArrowRight');
+  check('the second key moves again', cur() === 'switch', cur());
+  A.sleep();
+  $('open-drawer').click();
+  await sleep(350);
+  check('a popup taking focus wakes navigation and gets the highlight', !A.asleep() && ['d1', 'd2', 'd3'].includes(cur()), cur());
+  key('Escape'); await sleep(200);
+
   // ---- report
   const failed = results.filter(r => !r.ok);
   document.getElementById('out').innerHTML = results.map(r =>
