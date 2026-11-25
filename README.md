@@ -21,6 +21,7 @@ Autodarts runs great on a Raspberry Pi at the board, and the web app is the natu
 - **Smart directional search** — pressing *up* really goes up: same-column/row elements are preferred, with a 45° cone as fallback
 - **Auto-scroll** — if there's nothing further in the pressed direction, the page scrolls and the search continues, so the very top and bottom of long pages stay reachable (works with virtualized lists too)
 - **Cursor fallback** — press MENU to toggle a free-moving virtual mouse cursor for anything the focus navigation can't reach
+- **Stays out of the way during a match** — after 10 seconds without a key press the navigation goes to sleep and costs nothing, so the page has the whole device for scoring and the caller; the next key press brings the highlight back
 - **TV-sized layout** — the page is laid out 1280 px wide instead of the 960 px a 1080p TV reports, so the site shows its desktop layout rather than a phone layout blown up 2×
 - **Fullscreen, landscape, no browser chrome**
 
@@ -34,6 +35,8 @@ Autodarts runs great on a Raspberry Pi at the board, and the web app is the natu
 | MENU | Toggle between focus navigation and free cursor mode |
 
 In text fields: left/right move the caret, up/down leave the field and resume navigation.
+
+After 10 seconds without input the highlight disappears. The first press afterwards only brings it back where it was; the next one moves or clicks.
 
 ## Building
 
@@ -95,6 +98,8 @@ Autodarts Play (rebuilt in 2026 on Tailwind + shadcn/ui + Base UI) shapes three 
 - **The page does not scroll, a container inside `<main>` does**, under a fixed header. Searches start from what is visible of the current element, and a press with nothing in range scrolls that container.
 
 A `MutationObserver` re-picks the highlight when the current element disappears — near where it was after a re-render, at the first content item after a route change.
+
+All of that runs on the page's main thread, the one that also processes thrown darts and starts the caller. On weak hardware (Fire TV Stick) keeping it running through a match made matches stall and calls go missing ([#4](https://github.com/TheJim03/Autodarts-TV/issues/4)). So after 10 seconds without a key press the script sleeps: observer disconnected, ring hidden, timers idle. Only direct children of `<body>` are still watched, which is where popups such as the end-of-match dialog mount; one appearing, or the next key press, wakes it. The ring's pulse animates opacity on its own layer, so it never repaints on the main thread either.
 
 ## Troubleshooting
 

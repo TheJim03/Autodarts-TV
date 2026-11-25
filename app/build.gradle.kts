@@ -11,8 +11,8 @@ android {
         applicationId = "io.autodarts.tv"
         minSdk = 24            // covers basically every Android TV out there
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1.0"
     }
 
     buildTypes {
